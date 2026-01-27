@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Uploads (if using local storage)
+uploads/
+.env
+.env.*
+!.env.example
+# Logs
+logs/
+*.log
+/Canvas
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Build output
+dist/
+build/
+*.tgz
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Database
+*.sqlite
+*.sqlite3
+
+# AWS
+.aws-sam/
+
+# Misc
+.cache/
+*.seed
+*.pid
+*.pid.lock
