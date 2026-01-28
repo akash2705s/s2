@@ -341,7 +341,7 @@ async function generateCombinedCampaignVast(campaignId, options = {}) {
     // Ensure all elementIds are strings (OverlayElement uses String _id)
     const elementIds = runningAdUnits.map((u) => String(u.elementId)).filter(Boolean);
     console.log(`[VAST] Searching for ${elementIds.length} elements with IDs:`, elementIds);
-    
+
     // Query using string IDs (OverlayElement schema uses String _id)
     const elements = await Element.find({
         _id: { $in: elementIds },
@@ -691,6 +691,45 @@ async function generateCombinedCampaignVast(campaignId, options = {}) {
         let endOffset = cfg.display?.endOffset || (cfg.vast?.display?.timeTriggers?.[0]?.triggerTime + `:${cfg.vast?.display?.timeTriggers?.[0]?.duration}`) || "00:00:20";
         display.ele("StartOffset").txt(startOffset);
         display.ele("EndOffset").txt(endOffset);
+
+        // QR display duration (for corner-banner / layered creatives)
+        // Look for a QR layer in the new layers structure and surface its duration into VAST
+        try {
+            let qrDisplayDurationSeconds = null;
+
+            // New structure: configuration.content.layers[*].qrCode.{duration, qrDisplayDurationSeconds}
+            if (Array.isArray(cfg.content?.layers)) {
+                const qrLayer = cfg.content.layers.find(l => l && l.type === 'qr' && l.qrCode);
+                if (qrLayer && qrLayer.qrCode) {
+                    const qrCfg = qrLayer.qrCode;
+                    if (typeof qrCfg.qrDisplayDurationSeconds === 'number') {
+                        qrDisplayDurationSeconds = qrCfg.qrDisplayDurationSeconds;
+                    } else if (qrCfg.qrDisplayDurationSeconds != null && !Number.isNaN(Number(qrCfg.qrDisplayDurationSeconds))) {
+                        qrDisplayDurationSeconds = Number(qrCfg.qrDisplayDurationSeconds);
+                    } else if (typeof qrCfg.duration === 'number') {
+                        qrDisplayDurationSeconds = qrCfg.duration;
+                    } else if (qrCfg.duration != null && !Number.isNaN(Number(qrCfg.duration))) {
+                        qrDisplayDurationSeconds = Number(qrCfg.duration);
+                    }
+                }
+            }
+
+            // Legacy structure (if any): configuration.content.poll.qrCode / configuration.content.poll.qrDisplayDurationSeconds
+            if (qrDisplayDurationSeconds == null && cfg.content?.poll) {
+                const poll = cfg.content.poll;
+                if (typeof poll.qrDisplayDurationSeconds === 'number') {
+                    qrDisplayDurationSeconds = poll.qrDisplayDurationSeconds;
+                } else if (poll.qrDisplayDurationSeconds != null && !Number.isNaN(Number(poll.qrDisplayDurationSeconds))) {
+                    qrDisplayDurationSeconds = Number(poll.qrDisplayDurationSeconds);
+                }
+            }
+
+            if (qrDisplayDurationSeconds != null && Number.isFinite(qrDisplayDurationSeconds) && qrDisplayDurationSeconds > 0) {
+                display.ele("QRDisplayDurationSeconds").txt(String(qrDisplayDurationSeconds));
+            }
+        } catch (qrErr) {
+            console.warn(`[VAST] Failed to derive QR display duration for element ${element._id}:`, qrErr.message);
+        }
 
         // If multiple timeTriggers (e.g., in full-page-ad), add as extension
         if (cfg.vast?.display?.timeTriggers && cfg.vast?.display?.timeTriggers.length > 1) {
@@ -1118,6 +1157,34 @@ async function generateCombinedBrandVasts(brandId) {
         let endOffset = elementConfig.display?.endOffset || (elementConfig.vast?.display?.timeTriggers?.[0]?.triggerTime + `:${elementConfig.vast?.display?.timeTriggers?.[0]?.duration}`) || "00:00:20";
         display.ele("StartOffset").txt(startOffset);
         display.ele("EndOffset").txt(endOffset);
+
+        // QR display duration (for corner-banner / layered creatives on brand VAST)
+        // Same logic as campaign VAST: surface QR layer duration into XML for downstream players
+        try {
+            let qrDisplayDurationSeconds = null;
+
+            if (Array.isArray(elementConfig.content?.layers)) {
+                const qrLayer = elementConfig.content.layers.find(l => l && l.type === 'qr' && l.qrCode);
+                if (qrLayer && qrLayer.qrCode) {
+                    const qrCfg = qrLayer.qrCode;
+                    if (typeof qrCfg.qrDisplayDurationSeconds === 'number') {
+                        qrDisplayDurationSeconds = qrCfg.qrDisplayDurationSeconds;
+                    } else if (qrCfg.qrDisplayDurationSeconds != null && !Number.isNaN(Number(qrCfg.qrDisplayDurationSeconds))) {
+                        qrDisplayDurationSeconds = Number(qrCfg.qrDisplayDurationSeconds);
+                    } else if (typeof qrCfg.duration === 'number') {
+                        qrDisplayDurationSeconds = qrCfg.duration;
+                    } else if (qrCfg.duration != null && !Number.isNaN(Number(qrCfg.duration))) {
+                        qrDisplayDurationSeconds = Number(qrCfg.duration);
+                    }
+                }
+            }
+
+            if (qrDisplayDurationSeconds != null && Number.isFinite(qrDisplayDurationSeconds) && qrDisplayDurationSeconds > 0) {
+                display.ele("QRDisplayDurationSeconds").txt(String(qrDisplayDurationSeconds));
+            }
+        } catch (qrErr) {
+            console.warn(`[VAST-Brand] Failed to derive QR display duration for element ${element._id}:`, qrErr.message);
+        }
 
         // If multiple timeTriggers (e.g., in full-page-ad), add as extension
         if (elementConfig.vast?.display?.timeTriggers && elementConfig.vast?.display?.timeTriggers.length > 1) {
