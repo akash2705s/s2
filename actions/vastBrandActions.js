@@ -633,7 +633,7 @@ async function generateCombinedCampaignVast(campaignId, options = {}) {
 
         let adContainer;
 
-        if (["corner-banner", "l-banner", "full-page-ad"].includes(elemType)) {
+        if (["corner-banner", "l-banner", "full-page-ad", "lower-third-ad"].includes(elemType)) {
             // NonLinear for overlays
             adContainer = creative.ele("NonLinearAds").ele("NonLinear", {
                 width: elementConfig?.layout?.dimensions?.width || "1280",
@@ -762,8 +762,8 @@ async function generateCombinedCampaignVast(campaignId, options = {}) {
         const display = adContainer.ele("Display");
         const cfg = element.configuration || {};
         // Handle different config paths (from your samples)
-        let startOffset = cfg.display?.startOffset || cfg.vast?.display?.timeTriggers?.[0]?.triggerTime || "00:00:05";
-        let endOffset = cfg.display?.endOffset || (cfg.vast?.display?.timeTriggers?.[0]?.triggerTime + `:${cfg.vast?.display?.timeTriggers?.[0]?.duration}`) || "00:00:20";
+        let startOffset = cfg.display?.startOffset || cfg.vast?.display?.startOffset || cfg.vast?.display?.timeTriggers?.[0]?.triggerTime || "00:00:05";
+        let endOffset = cfg.display?.endOffset || cfg.vast?.display?.endOffset || (cfg.vast?.display?.timeTriggers?.[0]?.triggerTime + `:${cfg.vast?.display?.timeTriggers?.[0]?.duration}`) || "00:00:20";
         display.ele("StartOffset").txt(startOffset);
         display.ele("EndOffset").txt(endOffset);
 
@@ -1157,7 +1157,7 @@ async function generateCombinedBrandVasts(brandId, options = {}) {
 
         let adContainer;
 
-        if (["corner-banner", "l-banner", "full-page-ad"].includes(elemType)) {
+        if (["corner-banner", "l-banner", "full-page-ad", "lower-third-ad"].includes(elemType)) {
             // NonLinear for overlays
             adContainer = creative.ele("NonLinearAds").ele("NonLinear", {
                 width: elementConfig?.layout?.dimensions?.width || "1280",
@@ -1285,8 +1285,8 @@ async function generateCombinedBrandVasts(brandId, options = {}) {
         // Dynamic Display timing - pulled from element config dynamically
         const display = adContainer.ele("Display");
         // Handle different config paths (from your samples)
-        let startOffset = elementConfig.display?.startOffset || elementConfig.vast?.display?.timeTriggers?.[0]?.triggerTime || "00:00:05";
-        let endOffset = elementConfig.display?.endOffset || (elementConfig.vast?.display?.timeTriggers?.[0]?.triggerTime + `:${elementConfig.vast?.display?.timeTriggers?.[0]?.duration}`) || "00:00:20";
+        let startOffset = elementConfig.display?.startOffset || elementConfig.vast?.display?.startOffset || elementConfig.vast?.display?.timeTriggers?.[0]?.triggerTime || "00:00:05";
+        let endOffset = elementConfig.display?.endOffset || elementConfig.vast?.display?.endOffset || (elementConfig.vast?.display?.timeTriggers?.[0]?.triggerTime + `:${elementConfig.vast?.display?.timeTriggers?.[0]?.duration}`) || "00:00:20";
         display.ele("StartOffset").txt(startOffset);
         display.ele("EndOffset").txt(endOffset);
 
@@ -1471,8 +1471,8 @@ async function generateCombinedCampaignVast_old(campaignId) {
         // Display timing - pulled from element config if present, else fallback
         const display = nonLinear.ele("Display");
         const cfg = element.configuration || {};
-        display.ele("StartOffset").txt(cfg.display?.startOffset || "00:00:05");
-        display.ele("EndOffset").txt(cfg.display?.endOffset || "00:00:20");
+        display.ele("StartOffset").txt(cfg.display?.startOffset || cfg.vast?.display?.startOffset || "00:00:05");
+        display.ele("EndOffset").txt(cfg.display?.endOffset || cfg.vast?.display?.endOffset || "00:00:20");
 
         // Optional: add companion/banner if needed for web fallback
     });
