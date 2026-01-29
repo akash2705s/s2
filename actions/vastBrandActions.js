@@ -233,6 +233,27 @@ exports.getRandomBrandVast = async (req, res) => {
         res.send(generated.xml);
     } catch (err) {
         console.error(`[VAST Brand Error] brand=${brandId}:`, err);
+
+        // If generation code already returned an empty brand VAST (no matching elements),
+        // respond with a valid, empty VAST instead of JSON error.
+        if (err && typeof err.message === 'string' && err.message.includes('No matching elements found for running ad units')) {
+            const emptyVast = xmlbuilder.begin()
+                .dec({ version: "1.0", encoding: "UTF-8" })
+                .ele("VAST")
+                .att("version", "4.1")
+                .att("xmlns", "http://www.iab.com/VAST")
+                .att("xmlns:xs", "http://www.w3.org/2001/XMLSchema")
+                .att("xmlns:canvas", "http://canvas-siau.com/extensions")
+                .end({ pretty: true });
+
+            res.set({
+                'Content-Type': 'application/xml',
+                'Content-Disposition': `inline; filename="brand-${brandId}-vast.xml"`,
+                'Cache-Control': 'no-cache',
+            });
+            return res.send(emptyVast);
+        }
+
         return res.status(500).json({ error: "Failed to generate brand VAST", details: err.message });
     }
 };
@@ -885,6 +906,19 @@ async function generateCombinedBrandVasts(brandId, options = {}) {
     console.log(`[Brand VAST] Total running element IDs: ${runningElementIds.size}`);
     console.log(`[Brand VAST] Running element IDs:`, Array.from(runningElementIds));
 
+    // Helper to build an empty VAST document for brand-level requests
+    const buildEmptyBrandVast = () => {
+        const emptyVast = xmlbuilder.begin()
+            .dec({ version: "1.0", encoding: "UTF-8" })
+            .ele("VAST")
+            .att("version", "4.1")
+            .att("xmlns", "http://www.iab.com/VAST")
+            .att("xmlns:xs", "http://www.w3.org/2001/XMLSchema")
+            .att("xmlns:canvas", "http://canvas-siau.com/extensions");
+
+        return emptyVast.end({ pretty: true });
+    };
+
     const elements = await Element.find({
         brandId,
         _id: { $in: Array.from(runningElementIds) }
@@ -896,16 +930,17 @@ async function generateCombinedBrandVasts(brandId, options = {}) {
     });
 
     if (elements.length === 0) {
-        // Check if there are any live elements for this brand that aren't in campaigns
-        const allLiveElements = await Element.find({
-            brandId,
-            'meta.status': 'live'
-        });
-        console.log(`[Brand VAST] Found ${allLiveElements.length} live elements for brand ${brandId} that are not in running campaigns`);
-        allLiveElements.forEach(elem => {
-            console.log(`[Brand VAST] Live element not in campaigns: ${elem._id} (${elem.meta?.elementType || 'unknown'}) - ${elem.meta?.title || 'Untitled'}`);
-        });
-        throw new Error("No matching elements found for running ad units");
+        // No matching elements for any running ad units -> return an empty VAST instead of throwing
+        console.log(`[Brand VAST] No matching elements found for running ad units – returning empty VAST for brand ${brandId}.`);
+        const xmlString = buildEmptyBrandVast();
+        const s3Key = `vast/brand/${brandId}.xml`;
+
+        return {
+            xml: xmlString,
+            s3Key,
+            saved: false,
+            adCount: 0,
+        };
     }
 
     // 4. Build VAST root with correct XML declaration and VAST version
@@ -1346,6 +1381,8 @@ async function generateCombinedCampaignVast_old(campaignId) {
     }).lean(); // lean for performance
 
     if (elements.length === 0) {
+        // For campaign-level combined VAST (used by tools / admin), keep throwing;
+        // callers of generateCombinedCampaignVast already map this to a 500/JSON response.
         throw new Error("No matching elements found for running ad units");
     }
 
