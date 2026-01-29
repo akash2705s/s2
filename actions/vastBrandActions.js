@@ -11,6 +11,59 @@ const bucket = process.env.S3_BUCKET_NAME;
 const { getIPAndGeo } = require("../utils/ipGeolocation");
 const VastRequestLog = require("../models/VastRequestLog");
 
+// Allowed CTV / OEM platforms for tv filter
+const ALLOWED_TV_PLATFORMS = new Set(['LG', 'Roku', 'VIZIO', 'Samsung', 'Fire TV']);
+
+function canonicalizePlatform(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return null;
+    const u = raw.toUpperCase();
+    if (u === 'ROKU') return 'Roku';
+    if (u === 'LG') return 'LG';
+    if (u === 'VIZIO') return 'VIZIO';
+    if (u === 'SAMSUNG') return 'Samsung';
+    if (u === 'FIRETV' || u === 'FIRE' || u === 'FIRE_TV' || u === 'FIRE TV') return 'Fire TV';
+    return raw;
+}
+
+/**
+ * Parse tv query param into a single OEM platform.
+ *
+ * Supported formats (single value only):
+ * - ?tv=LG
+ * - ?tv=lg
+ * - ?tv=(LG)
+ *
+ * Multi-value formats like ?tv=LG,Roku or ?tv=(LG,Roku,Vizio) are rejected.
+ */
+function parseTvPlatforms(tvParam) {
+    if (tvParam === undefined || tvParam === null) {
+        return { platforms: [] };
+    }
+
+    const raw = String(tvParam).trim();
+    if (!raw) {
+        return { platforms: [] };
+    }
+
+    // Reject any commas or multiple values
+    if (raw.includes(',')) {
+        return { error: "tv must be a single OEM value like ?tv=LG" };
+    }
+
+    // Allow optional surrounding parentheses: "(LG)" -> "LG"
+    const stripped = raw.replace(/^\(/, '').replace(/\)$/, '');
+
+    const canonical = canonicalizePlatform(stripped);
+    if (!canonical || !ALLOWED_TV_PLATFORMS.has(canonical)) {
+        return {
+            error: `unsupported tv platform '${stripped}'. allowed: ${Array.from(ALLOWED_TV_PLATFORMS).join(', ')}`
+        };
+    }
+
+    return { platforms: [canonical] };
+}
+
 // Helper: clean XML string to remove duplicate declarations (same as in vastActions.js)
 function cleanXmlString(xmlString) {
     if (!xmlString) return xmlString;
@@ -131,12 +184,15 @@ exports.getRandomCampaignVast = async (req, res) => {
 exports.getRandomBrandVast = async (req, res) => {
     const { brandId } = req.params;
     const forceGenerate = req.query.forceGenerate === 'true' || req.query.forceGenerate === 'True';
+    const tvParsed = parseTvPlatforms(req.query.tv);
+    if (tvParsed?.error) {
+        return res.status(400).json({ error: tvParsed.error });
+    }
+    const tvPlatforms = tvParsed.platforms || [];
 
     if (!brandId || typeof brandId !== 'string') {
         return res.status(400).json({ error: "Invalid brand ID format" });
     }
-
-    const s3Key = `vast/brands/${brandId}.xml`;
 
     try {
         // 1. Log the request BEFORE serving
@@ -161,57 +217,23 @@ exports.getRandomBrandVast = async (req, res) => {
             timestamp: new Date(),
         });
 
-        console.log(`[VAST Request Log] Brand ${brandId} requested from IP ${geoData.ip} (${geoData.city || 'unknown'}, ${geoData.country || 'unknown'})${forceGenerate ? ' [FORCE REGENERATE]' : ''}`);
+        console.log(
+            `[VAST Request Log] Brand ${brandId} requested from IP ${geoData.ip} (${geoData.city || 'unknown'}, ${geoData.country || 'unknown'})` +
+            `${forceGenerate ? ' [FORCE REGENERATE]' : ''}` +
+            `${tvPlatforms.length ? ` [TV=${tvPlatforms.join(',')}]` : ''}`
+        );
 
-        // 2. If forceGenerate is true, regenerate and return
-        if (forceGenerate) {
-            try {
-                const generated = await generateCombinedBrandVasts(brandId);
-                res.set({
-                    'Content-Type': 'application/xml',
-                    'Content-Disposition': `inline; filename="brand-${brandId}-vast.xml"`,
-                    'Cache-Control': 'no-cache',
-                });
-                res.send(generated.xml);
-                return;
-            } catch (genErr) {
-                console.error(`[VAST Force Generate Error] Brand ${brandId}:`, genErr);
-                return res.status(500).json({ error: "Failed to generate brand VAST", details: genErr.message });
-            }
-        }
-
-        // 3. Fetch from S3
-        const command = new GetObjectCommand({
-            Bucket: bucket,
-            Key: s3Key,
-        });
-
-        const data = await s3Client.send(command);
-
-        // 4. Stream response
+        // 2. Always generate on demand (cache bypassed), tv filter is optional
+        const generated = await generateCombinedBrandVasts(brandId, { tvPlatforms });
         res.set({
             'Content-Type': 'application/xml',
             'Content-Disposition': `inline; filename="brand-${brandId}-vast.xml"`,
-            'Cache-Control': 'public, max-age=300',
+            'Cache-Control': 'no-cache',
         });
-
-        data.Body.pipe(res);
-
+        res.send(generated.xml);
     } catch (err) {
-        if (err.name === 'NoSuchKey') {
-            // Fallback: generate on demand if missing
-            try {
-                const generated = await generateCombinedBrandVasts(brandId);
-                res.set('Content-Type', 'application/xml');
-                res.send(generated.xml);
-            } catch (genErr) {
-                console.error(`[VAST Generate Error] Brand ${brandId}:`, genErr);
-                res.status(500).json({ error: "Failed to generate brand VAST", details: genErr.message });
-            }
-        } else {
-            console.error(`[VAST Brand Error] ${s3Key}:`, err);
-            res.status(500).json({ error: "Failed to retrieve brand VAST" });
-        }
+        console.error(`[VAST Brand Error] brand=${brandId}:`, err);
+        return res.status(500).json({ error: "Failed to generate brand VAST", details: err.message });
     }
 };
 
@@ -336,6 +358,16 @@ async function generateCombinedCampaignVast(campaignId, options = {}) {
             campaignName: campaign.name,
         };
     }
+
+    // Build elementId -> Set(environments) so we can inject platform/OEM into VAST
+    const platformsByElementId = new Map();
+    runningAdUnits.forEach((unit) => {
+        const key = String(unit.elementId);
+        if (!platformsByElementId.has(key)) platformsByElementId.set(key, new Set());
+        if (unit.environment) {
+            platformsByElementId.get(key).add(canonicalizePlatform(unit.environment) || unit.environment);
+        }
+    });
 
     // 3. Fetch full elements (Element docs)
     // Ensure all elementIds are strings (OverlayElement uses String _id)
@@ -535,6 +567,10 @@ async function generateCombinedCampaignVast(campaignId, options = {}) {
 
     // 5. Add one <Ad> per running element (sequence = index + 1)
     elements.forEach((element, index) => {
+        const envSet = platformsByElementId.get(String(element._id)) || new Set();
+        const platforms = Array.from(envSet).filter(Boolean);
+        const platform = platforms[0] || null;
+
         const ad = vast.ele("Ad", {
             id: element._id,
             sequence: index + 1,
@@ -609,6 +645,8 @@ async function generateCombinedCampaignVast(campaignId, options = {}) {
             JSON.stringify({
                 elementId: element._id,
                 campaignId: campaignId,
+                platform,
+                platforms,
                 elementType: elemType,
                 configuration: elementConfig,
                 meta: element.meta || {},
@@ -642,43 +680,59 @@ async function generateCombinedCampaignVast(campaignId, options = {}) {
         // Standard events
         trackingEvents.ele("Tracking", { event: "impression" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/impression/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "creativeView" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/creativeView/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "click" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/click/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&value=[selectedValue]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&value=[selectedValue]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "complete" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/complete/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "close" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/close/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         // QR-specific events
         trackingEvents.ele("Tracking", { event: "qrShown" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/qrShown/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "qrClosed" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/qrClosed/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "qrOpened" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/qrOpened/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         // Optional: add viewable, firstQuartile, midpoint, thirdQuartile if video-based
@@ -778,7 +832,9 @@ exports.generateCombinedCampaignVast = generateCombinedCampaignVast;
  * Returns { xml: string, s3Key: string, saved: boolean }
  * campaingId
  */
-async function generateCombinedBrandVasts(brandId) {
+async function generateCombinedBrandVasts(brandId, options = {}) {
+
+    const { tvPlatforms = [] } = options;
 
     // 1. Fetch brand and verify
     const brand = await Brand.findById(brandId);
@@ -798,13 +854,30 @@ async function generateCombinedBrandVasts(brandId) {
     console.log(`[Brand VAST] Found ${campaigns.length} active campaigns with running ad units for brand ${brandId}`);
 
     const runningElementIds = new Set();
+    // elementId -> Set(environments) so we can inject platform into VAST
+    const environmentsByElementId = new Map();
+
+    const tvFilterSet = tvPlatforms.length
+        ? new Set(tvPlatforms.map(v => String(v).toLowerCase()))
+        : null;
 
     campaigns.forEach(campaign => {
         console.log(`[Brand VAST] Campaign ${campaign._id} has ${campaign.adUnits.length} ad units`);
         campaign.adUnits.forEach(unit => {
             if (unit.status === 'running') {
+                // Optional OEM filter: unit.environment must match requested platform(s)
+                if (tvFilterSet) {
+                    const unitPlatform = canonicalizePlatform(unit.environment);
+                    const env = String(unitPlatform || '').toLowerCase();
+                    if (!tvFilterSet.has(env)) return;
+                }
+
                 runningElementIds.add(unit.elementId);
                 console.log(`[Brand VAST] Added element ${unit.elementId} from campaign ${campaign._id}`);
+
+                const key = String(unit.elementId);
+                if (!environmentsByElementId.has(key)) environmentsByElementId.set(key, new Set());
+                environmentsByElementId.get(key).add(canonicalizePlatform(unit.environment) || unit.environment);
             }
         });
     });
@@ -1001,6 +1074,10 @@ async function generateCombinedBrandVasts(brandId) {
 
     // 5. Add one <Ad> per running element (sequence = index + 1)
     elements.forEach((element, index) => {
+        const envSet = environmentsByElementId.get(String(element._id)) || new Set();
+        const platforms = Array.from(envSet).filter(Boolean);
+        const platform = platforms[0] || null;
+
         const ad = vast.ele("Ad", {
             id: element._id,
             sequence: index + 1,
@@ -1017,6 +1094,7 @@ async function generateCombinedBrandVasts(brandId) {
         inLine.ele("Impression").dat(
             `${process.env.DOMAIN_NAME}/api/track/impression/${element._id}` +
             `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
             `&sessionId=[sessionId]` +
             `&ts=[timestamp]`
         );
@@ -1025,6 +1103,7 @@ async function generateCombinedBrandVasts(brandId) {
         inLine.ele("Error").dat(
             `${process.env.DOMAIN_NAME}/api/track/error/${element._id}` +
             `?campaignId=${campaignId}&err=[ERRORCODE]` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
             `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
@@ -1076,6 +1155,8 @@ async function generateCombinedBrandVasts(brandId) {
             JSON.stringify({
                 elementId: element._id,
                 campaignId: campaignId,
+                platform,
+                platforms,
                 elementType: elemType,
                 configuration: elementConfig,
                 meta: element.meta || {},
@@ -1109,43 +1190,59 @@ async function generateCombinedBrandVasts(brandId) {
         // Standard events
         trackingEvents.ele("Tracking", { event: "impression" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/impression/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "creativeView" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/creativeView/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "click" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/click/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&value=[selectedValue]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&value=[selectedValue]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "complete" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/complete/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "close" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/close/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         // QR-specific events
         trackingEvents.ele("Tracking", { event: "qrShown" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/qrShown/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "qrClosed" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/qrClosed/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         trackingEvents.ele("Tracking", { event: "qrOpened" }).dat(
             `${process.env.DOMAIN_NAME}/api/track/qrOpened/${element._id}` +
-            `?campaignId=${campaignId}&sessionId=[sessionId]&ts=[timestamp]`
+            `?campaignId=${campaignId}` +
+            `${platform ? `&platform=${encodeURIComponent(platform)}` : ''}` +
+            `&sessionId=[sessionId]&ts=[timestamp]`
         );
 
         // Optional: add viewable, firstQuartile, midpoint, thirdQuartile if video-based
